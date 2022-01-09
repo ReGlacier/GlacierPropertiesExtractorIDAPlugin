@@ -1,7 +1,7 @@
 # coding: utf-8
-import ida_bytes
-import ida_enum
 import ida_name
+import ida_segment
+import idautils
 import idaapi
 import struct
 import idc
@@ -10,11 +10,9 @@ import json
 
 class PrepareGlacierPropertiesTableAction(idaapi.action_handler_t):
     def __init__(self,
-                 auto_register_enumerations=False,
                  add_trivial_property_comments=False,
                  rename_property_table_entry_points=False):
         idaapi.action_handler_t.__init__(self)
-        self._auto_register_enumerations = auto_register_enumerations
         self._add_trivial_property_comments = add_trivial_property_comments
         self._rename_property_table_entry_pointer = rename_property_table_entry_points
 
@@ -41,7 +39,7 @@ class PrepareGlacierPropertiesTableAction(idaapi.action_handler_t):
             print("WARNING: Your class name will not be recognized because your function does not contains class name!")
 
         class_name_org = class_properties_provider_function_name.split('::')[0] if '::' in class_properties_provider_function_name else class_properties_provider_function_name
-        class_properties, class_parents, class_name = self.prepare_class_properties(class_properties_address, class_name_org)
+        class_properties, class_parents, class_name = self.prepare_class_properties(class_properties_address)
 
         result = {
             'class_name': class_name_org,
@@ -55,10 +53,66 @@ class PrepareGlacierPropertiesTableAction(idaapi.action_handler_t):
         print("RESULT: ")
         print(json.dumps(result))
 
-    def prepare_class_properties(self, header_address, ext_class_name):
+    def prepare_class_properties(self, header_address):
         first_property_address = struct.unpack('<i', idc.get_bytes(header_address, 4))[0]
         first_parent_address = struct.unpack('<i', idc.get_bytes(header_address + 4, 4))[0]
         name_address = struct.unpack('<i', idc.get_bytes(header_address + 0x8, 0x4))[0]
+
+        idc.create_dword(header_address)
+        idc.create_dword(header_address + 0x4)
+        idc.create_dword(header_address + 0x8)
+
+        class_name = None
+
+        if self._rename_property_table_entry_pointer:
+            xrefs_to_symbol = [xref.frm for xref in idautils.XrefsTo(header_address) if
+                               xref.to == header_address and ida_segment.getseg(
+                                   xref.frm).sclass == ida_segment.SEG_CODE]
+            if len(xrefs_to_symbol) == 0:
+                print("Unable to recognize name of symbol at {:08X}".format(header_address))
+            else:
+                xrefs_to_function = [xref.frm for xref in idautils.XrefsTo(xrefs_to_symbol[0]) if
+                                     idc.get_segm_name(xref.frm).lower() == ".rdata"]
+                if len(xrefs_to_function) == 0:
+                    print("Unable to recognize pointer of vftable to function at {:08X} for symbol at {:08X}".format(
+                        xrefs_to_symbol[0], header_address))
+                else:
+                    # Here we need to find root of vtbl
+                    vtbl_root_found = False
+                    vtbl_addr = xrefs_to_function[0]
+                    step_limits = 777
+                    steps_performed = 1
+                    while steps_performed <= step_limits:
+                        if struct.unpack('<i', idc.get_bytes(vtbl_addr, 0x4))[0] == 0:
+                            vtbl_addr += 0x4
+                            vtbl_root_found = True
+                            break
+
+                        vtbl_addr -= 0x4
+                        steps_performed += 1
+
+                    if not vtbl_root_found:
+                        print("Too big vtbl for method at {:08X} for symbol at {:08X}".format(xrefs_to_function[0],
+                                                                                              header_address))
+                    else:
+                        """ 
+                            NOTE: Here we should unroll RTTI internals but it's a little buggy
+                            Original code (fix later or never)
+
+                            rtti_addr = struct.unpack('<i', idc.get_bytes(vtbl_addr, 0x4))[0]
+                            rtti_description_addr = struct.unpack('<i', idc.get_bytes(rtti_addr + 0xC, 0x4))[0]
+                            rtti_type_name = idc.get_strlit_contents(rtti_description_addr + 0x8).decode('ascii')
+
+                            here we unable to demangle value of rtti_type_name. Really don't know why
+                            I will do same thing easier
+                        """
+                        # Take off 0x10
+                        rtti_type_name = idc.generate_disasm_line(vtbl_addr, 0)
+                        rtti_type_name = rtti_type_name[
+                                         rtti_type_name.index('; const ') + 8: rtti_type_name.index('::`')]
+
+                        class_name = rtti_type_name
+                        idc.set_name(header_address, '{}::Info'.format(rtti_type_name), ida_name.SN_PUBLIC)
 
         properties = []
         parents = []
@@ -70,24 +124,16 @@ class PrepareGlacierPropertiesTableAction(idaapi.action_handler_t):
             name = None
 
         if not first_property_address == 0x0:
-            properties = self.prepare_properties_recursive(first_property_address, ext_class_name if name is None else name)
+            properties = self.prepare_properties_recursive(first_property_address, class_name)
         else:
             properties = None
 
         if not first_parent_address == 0x0:
-            parents = self.prepare_class_properties(first_parent_address, ext_class_name if name is None else name)
+            parents = self.prepare_class_properties(first_parent_address)
         else:
             parents = None
 
-        if self._rename_property_table_entry_pointer:
-            current_name = idc.get_name(header_address)
-            if current_name.startswith('unk_') or current_name.startswith('dword_'):
-                idc.set_name(header_address, '{}::Info'.format(ext_class_name if name is None else name), ida_name.SN_PUBLIC)
-                idc.create_dword(header_address)
-                idc.create_dword(header_address + 0x4)
-                idc.create_dword(header_address + 0x8)
-
-        return properties, parents, name
+        return properties, parents, name if name is not None else class_name
 
     def prepare_properties_recursive(self, property_address, class_name):
         result = []
@@ -95,29 +141,31 @@ class PrepareGlacierPropertiesTableAction(idaapi.action_handler_t):
         flag0 = struct.unpack('<i', idc.get_bytes(property_address + 0x4, 0x4))[0]
         flag1 = struct.unpack('<i', idc.get_bytes(property_address + 0x8, 0x4))[0]
         loader_function_vtable_address = struct.unpack('<i', idc.get_bytes(property_address + 0xC, 0x4))[0]
-        ida_name = None
 
-        if idc.hasUserName(property_address):
-            ida_name = idc.get_name(property_address)
+        idc.create_dword(property_address + 0x0)
+        idc.create_dword(property_address + 0x4)
+        idc.create_dword(property_address + 0x8)
+        idc.create_dword(property_address + 0xC)
 
         possible_pointer_or_offset = struct.unpack('<i', idc.get_bytes(property_address + 0x10, 0x4))[0]
         if not possible_pointer_or_offset == 0x0:
+            idc.create_dword(property_address + 0x10)
             # It's trivial type
-            type_obj = {
-                'type': 'Trivial',
-                'offset': possible_pointer_or_offset,
-                'address': '{:08X}'.format(property_address)
-            }
+            type_obj = {'type': 'Trivial', 'offset': possible_pointer_or_offset,
+                        'address': '{:08X}'.format(property_address),
+                        'name': str('{}::Property_{:X}'.format(class_name, possible_pointer_or_offset))}
 
-            if ida_name is not None:
-                type_obj['name'] = ida_name
-            else:
-                new_name = '{}::Property_{:X}'.format(class_name, possible_pointer_or_offset)
-                type_obj['name'] = new_name
-                idc.set_name(property_address, new_name, idc.SN_PUBLIC)
+            if self._rename_property_table_entry_pointer:
+                idc.set_name(property_address, type_obj['name'], idc.SN_PUBLIC)
 
             result.append(type_obj)
         else:
+            idc.create_dword(property_address + 0x10)
+            idc.create_dword(property_address + 0x14)
+            idc.create_dword(property_address + 0x18)
+            idc.create_dword(property_address + 0x1C)
+            idc.create_dword(property_address + 0x20)
+
             # # It's enum or field
             last_entry = struct.unpack('<i', idc.get_bytes(property_address + 0x20, 0x4))[0]
             is_enum = False
@@ -152,13 +200,6 @@ class PrepareGlacierPropertiesTableAction(idaapi.action_handler_t):
                     'data': enum_info,
                     'address': '{:08X}'.format(property_address)
                 }
-
-                if self._auto_register_enumerations and len(enum_info['entries']) > 0:
-                    enum_name = '{}::{}'.format(class_name, enum_info['name'])
-                    enum_id = ida_enum.add_enum(idc.BADADDR, enum_name, 0)
-                    for entry in enum_info['entries']:
-                        ida_enum.add_enum_member(enum_id, entry['name'], entry['value'], ida_enum.DEFMASK)
-                    print("Registered enum {}".format(enum_name))
 
                 result.append(type_obj)
 
@@ -196,9 +237,8 @@ class PluginUtils:
     PLUGIN_PATH = 'Edit/Plugins/Glacier Tools'
     PLUGIN_MENU_ENTRY_INSTERT_AFTER = PLUGIN_PATH
     PLUGIN_ACTIONS = [
-        ('ReGlacier:ExtractProperties', '[G1] Extract properties', PrepareGlacierPropertiesTableAction(False, False, False)),
-        ('ReGlacier:ExtractPropertiesAndMarkEnumerations', '[G1] Extract properties & mark enumerations', PrepareGlacierPropertiesTableAction(True, False, False)),
-        ('ReGlacier:ExtractPropertiesMarkEnumerationsAndRenameEntryPoints', '[G1] Extract properties & mark enumerations & rename entry points', PrepareGlacierPropertiesTableAction(True, True, True))
+        ('ReGlacier:ExtractProperties', '[G1] Extract properties', PrepareGlacierPropertiesTableAction(False, False)),
+        ('ReGlacier:ExtractPropertiesAndRenameEntryPoints', '[G1] Extract properties & rename entry points', PrepareGlacierPropertiesTableAction(True, True))
     ]
 
     @staticmethod
