@@ -47,6 +47,9 @@ class PrepareGlacierPropertiesTableAction(idaapi.action_handler_t):
             'parent': class_parents
         }
 
+        if self._rename_property_table_entry_pointer and idc.get_func_name(ea).startswith("sub_"):
+            idc.set_name(ea, "{}::GetProperties".format(class_name), ida_name.SN_PUBLIC)
+
         if self._add_trivial_property_comments:
             idc.set_cmt(ea, '{}::Info'.format(class_name_org), 0)
 
@@ -79,17 +82,16 @@ class PrepareGlacierPropertiesTableAction(idaapi.action_handler_t):
                 else:
                     # Here we need to find root of vtbl
                     vtbl_root_found = False
-                    vtbl_addr = xrefs_to_function[0]
-                    step_limits = 777
-                    steps_performed = 1
-                    while steps_performed <= step_limits:
-                        if struct.unpack('<i', idc.get_bytes(vtbl_addr, 0x4))[0] == 0:
-                            vtbl_addr += 0x4
-                            vtbl_root_found = True
-                            break
+                    vtbl_sp = xrefs_to_function[0]
+                    vtbl_addr = vtbl_sp
 
+                    vtbl_is_fp = True
+                    while vtbl_is_fp:
                         vtbl_addr -= 0x4
-                        steps_performed += 1
+                        vtbl_fp = struct.unpack('<i', idc.get_bytes(vtbl_addr, 0x4))[0]
+                        if idc.get_segm_name(vtbl_fp).lower() == ".rdata":
+                            vtbl_root_found = True
+                            vtbl_is_fp = False
 
                     if not vtbl_root_found:
                         print("Too big vtbl for method at {:08X} for symbol at {:08X}".format(xrefs_to_function[0],
@@ -108,8 +110,12 @@ class PrepareGlacierPropertiesTableAction(idaapi.action_handler_t):
                         """
                         # Take off 0x10
                         rtti_type_name = idc.generate_disasm_line(vtbl_addr, 0)
-                        rtti_type_name = rtti_type_name[
-                                         rtti_type_name.index('; const ') + 8: rtti_type_name.index('::`')]
+                        try:
+                            rtti_type_name = rtti_type_name[
+                                             rtti_type_name.index('; const ') + 8: rtti_type_name.index('::`')]
+                        except ValueError as ve:
+                            print("ValueError: Failed to prepare name {} at vtbl {:08X} origin {:08X}".format(rtti_type_name, vtbl_addr, xrefs_to_function[0]))
+                            raise ve
 
                         class_name = rtti_type_name
                         idc.set_name(header_address, '{}::Info'.format(rtti_type_name), ida_name.SN_PUBLIC)
