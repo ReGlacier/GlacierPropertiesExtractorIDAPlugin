@@ -185,16 +185,10 @@ class PrepareGlacierPropertiesTableAction(idaapi.action_handler_t):
                 type_obj = {
                     'type': 'Field',
                     'address': '{:08X}'.format(property_address),
-                    'loader_fn': loader_function_vtable_address,
+                    'loader_fn': '{:08X}'.format(loader_function_vtable_address),
                     'getter': '{:08X}'.format(property_address + 0x10),
                     'setter': '{:08X}'.format(property_address + 0x18)
                 }
-
-                if ida_name is not None:
-                    type_obj['name'] = ida_name
-                else:
-                    #TODO: Implement name extraction of recognized loaders?
-                    pass
 
                 result.append(type_obj)
             else:
@@ -228,7 +222,7 @@ class PrepareGlacierPropertiesTableAction(idaapi.action_handler_t):
         entry_value = struct.unpack('<i', idc.get_bytes(enum_entry_address + 0x4, 0x4))[0]
         entry_name_address = struct.unpack('<i', idc.get_bytes(enum_entry_address + 0x8, 0x4))[0]
         entry_name = idc.get_strlit_contents(entry_name_address).decode('ascii')
-        result.append({'name': entry_name, 'value': entry_value})
+        result.append({'name': str(entry_name), 'value': entry_value})
 
         if not next_entry == 0x0:
             result += self.extract_enum_entries_recursive(next_entry)
